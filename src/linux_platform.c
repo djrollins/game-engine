@@ -1,52 +1,78 @@
 /* standard library */
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 /* X11 headers */
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/keysym.h>
 
 int main()
 {
-	Display *display = XOpenDisplay(NULL);
+	XInitThreads();
+
+	int width = 1600;
+	int height = 900;
 	
+	Display *display = XOpenDisplay(NULL);
+
 	if (!display) {
-		// TODO(djr): Logging
+		/* TODO(djr): Logging */
 		fputs("X11: Unable to create connection to display server", stderr);
 		return -1;
 	}
 
 	int screen = DefaultScreen(display);
+	int root = RootWindow(display, screen);
+	
+	XVisualInfo vinfo;
+	if (!XMatchVisualInfo(display, screen, 32, TrueColor, &vinfo)) {
+		/* TODO(djr): Logging */
+		fputs("X11: Unable to find supported visual info", stderr);
+		return -1;
+	}
 
-	unsigned long black = BlackPixel(display, screen);
-	unsigned long white = WhitePixel(display, screen);
-	int width = 1600;
-	int height = 900;
+	Colormap colormap = XCreateColormap(
+			display, root, vinfo.visual, AllocNone);
 
-	Window window = XCreateSimpleWindow(
-			display, DefaultRootWindow(display),
+	const unsigned long wamask = CWBorderPixel | CWBackPixel | CWColormap | CWEventMask;
+
+	XSetWindowAttributes wa;
+	wa.colormap = colormap;
+	wa.background_pixel = WhitePixel(display, screen);
+	wa.border_pixel = 0;
+	wa.event_mask = KeyPressMask | ExposureMask | StructureNotifyMask;
+
+	Window window = XCreateWindow(
+			display,
+			root,
 			0, 0,
 			width, height,
-			20, white,
-			black);
-
+			0, /* border width */
+			vinfo.depth,
+			InputOutput,
+			vinfo.visual,
+			wamask,
+			&wa);
+			
 	if (!window) {
-		// TODO(djr): Logging
+		/* TODO(djr): Logging */
 		fputs("X11: Unable to create window", stderr);
 		return -1;
 	}
 
+	XMapWindow(display, window);
+
+	GC xgc = XCreateGC(display, window, 0, NULL);
+
+	uint32_t *pixels;
+	XImage *ximage = NULL;
+
 	XStoreName(display, window, "Simple Engine");
-	XSetIconName(display, window, "Simple Engine");
 
-	// Select which events to report
-	XSelectInput(display, window, KeyPressMask|ExposureMask);
-
-	// Allow us to handle a close event from the window manager
 	Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
 	XSetWMProtocols(display, window, &wm_delete_window, 1);
-
-	// Show the window
-	XMapWindow(display, window);
 
 	int running = 1;
 	while (running) {
@@ -57,15 +83,42 @@ int main()
 				if (((Atom)e.xclient.data.l[0] == wm_delete_window)) {
 					running = 0;
 				}
+				break;
 			case KeyPress:
 				if (XLookupKeysym(&e.xkey, 0) == XK_Escape) {
 					running = 0;
 				}
-			case Expose:
-			case ConfigureNotify:
 				break;
-			case UnmapNotify:
-				// TODO(djr): figure out why this event fires so often
+			case ConfigureNotify:
+				if (ximage && (width != e.xconfigure.width || height != e.xconfigure.height)) {
+					width = e.xconfigure.width;
+					height = e.xconfigure.height;
+					XDestroyImage(ximage);
+					ximage = NULL;
+				}
+				break;
+			case Expose:
+				if (!ximage) {
+					pixels = (uint32_t*)malloc(width * height * sizeof(uint32_t));
+
+					for (int i = 0; i < width * height; ++i) {
+						/* 0xBBGGRRAA */
+						pixels[i] = 0xFF0000FF;
+					}
+
+					ximage = XCreateImage(
+							display, CopyFromParent,
+							vinfo.depth, ZPixmap,
+							0, (char*)pixels,
+							width, height,
+							32, 0);
+				}
+				XPutImage(
+						display, window,
+						xgc, ximage,
+						0, 0,
+						0, 0,
+						width, height);
 				break;
 			default:
 				printf("Unhandled XEvent (%d)\n", e.type);
