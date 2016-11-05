@@ -1,26 +1,35 @@
 /* standard library */
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
+
+/* system headers */
+#include <sys/mman.h>
 
 /* X11 headers */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-Display *display;
-XVisualInfo vinfo;
-XImage ximage;
-void *pixels;
+static Display *display;
+static XVisualInfo vinfo;
+static XImage ximage;
+static void *pixels;
+static size_t buffer_size;
 
 static void resize_ximage(int width, int height)
 {
-	// TODO(djr): Need old width and height to free memory using munmap
-	if (pixels) {
-		free(pixels);
-	}
+	size_t new_buffer_size = width * height * 4;
 
-	pixels = malloc(width * height * 4);
+	if (new_buffer_size > buffer_size) {
+		munmap(pixels, buffer_size);
+		pixels = mmap(
+				NULL, new_buffer_size,
+				PROT_READ | PROT_WRITE,
+				MAP_ANONYMOUS | MAP_PRIVATE,
+				-1, 0);
+
+		buffer_size = new_buffer_size;
+	}
 
 	ximage.width = width;
 	ximage.height = height;
@@ -37,7 +46,6 @@ static void resize_ximage(int width, int height)
 	ximage.data = pixels;
 	ximage.bits_per_pixel = 32;
 	ximage.bytes_per_line = 0;
-
 
 	XInitImage(&ximage);
 }
@@ -105,7 +113,7 @@ int main()
 
 	XSetWindowAttributes wa;
 	wa.colormap = colormap;
-	wa.background_pixel = WhitePixel(display, screen);
+	wa.background_pixel = BlackPixel(display, screen);
 	wa.border_pixel = 0;
 	wa.event_mask = KeyPressMask | ExposureMask | StructureNotifyMask;
 
