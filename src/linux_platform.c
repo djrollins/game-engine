@@ -18,19 +18,17 @@ struct offscreen_buffer
 
 struct x11_device
 {
-	Display *display;
-	XVisualInfo vinfo;
 	XImage ximage;
+	XVisualInfo vinfo;
+	struct offscreen_buffer backbuffer;
+	Display *display;
 	Window window;
+	GC gc;
 	int root;
 	int screen;
 	int width;
 	int height;
-	GC gc;
-	struct offscreen_buffer backbuffer;
 };
-
-static struct x11_device device;
 
 static void resize_ximage(
 	struct x11_device *device,
@@ -110,6 +108,7 @@ int main()
 	int width = 1600;
 	int height = 900;
 	
+	static struct x11_device device;
 	device.display = XOpenDisplay(NULL);
 
 	if (!device.display) {
