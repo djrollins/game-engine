@@ -1,6 +1,7 @@
 /* standard library */
 #include <stdint.h>
 #include <string.h> /* strstr() */
+#include <math.h>
 #include <time.h>
 
 /* system headers */
@@ -17,6 +18,8 @@
 #include <X11/keysym.h>
 
 #include <alsa/asoundlib.h>
+
+#define MIN(x, y) (x) < (y) ? (x) : (y)
 
 struct joystick
 {
@@ -135,14 +138,46 @@ struct alsa_context
 	unsigned int periods;
 	unsigned int period_size;
 	snd_pcm_t *pcm_handle;
+	void *play_buffer;
 	struct ring_buffer buffer;
 };
 
 static int update_audio(struct alsa_context *context)
 {
-	static const struct timespec delay = { 0, 500000000 }; /* 0.5s */
-	(void)context;
-	nanosleep(&delay, NULL);
+	struct ring_buffer *buffer = &context->buffer;
+	pthread_mutex_t *const mutex = &buffer->mutex;
+
+	if (pthread_mutex_trylock(mutex) == 0) {
+		const int read_cursor = buffer->read_cursor;
+		const int write_cursor = buffer->write_cursor;
+		const int cursor_diff = write_cursor - read_cursor;
+		const int buffer_size = buffer->size;
+		const unsigned int frame_size = buffer->frame_size;
+		const unsigned int frames_to_end = buffer_size - read_cursor;
+		const unsigned int period_size = context->period_size;
+
+		unsigned int frames_to_write = 0;
+
+		if (cursor_diff > 0) {
+			frames_to_write = MIN((unsigned)cursor_diff, period_size);
+		} else if (cursor_diff < 0) {
+			frames_to_write = MIN(frames_to_end, period_size);
+		}
+
+		memcpy(context->play_buffer, buffer->data + (read_cursor * frame_size), frames_to_write * frame_size);
+
+		buffer->read_cursor = (read_cursor + frames_to_write) % buffer_size;
+
+		pthread_mutex_unlock(mutex);
+
+		if (frames_to_write) {
+			snd_pcm_writei(context->pcm_handle, context->play_buffer, frames_to_write);
+		} else {
+			const struct timespec delay = { 0, 10000L }; /* 10ms */
+			nanosleep(&delay, NULL);
+		}
+	}
+
 	return 1;
 }
 
@@ -223,13 +258,20 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 
 	assert(actual_buffer_time == expected_buffer_time);
 
-	/* allocate enough memory for the context struct and the ring buffer */
-	void *memory = malloc(sizeof(struct alsa_context) + (frame_size * buffer_size));
+	/* allocate enough memory for the context struct, the play_buffer and the ring buffer */
+	const size_t context_size = sizeof(struct alsa_context);
+	const size_t play_buffer_size = (frame_size * period_size);
+	const size_t ring_buffer_size = (frame_size * buffer_size);
+	const size_t total_memory_size = context_size + play_buffer_size + ring_buffer_size;
+
+	void *memory = malloc(total_memory_size);
 
 	if (!memory) {
 		fprintf(stderr, "Unable to allocate space for ALSA context\n");
 		return NULL;
 	}
+
+	memset(memory, 0, total_memory_size);
 
 	context = memory;
 	context->pcm_handle = pcm_handle;
@@ -237,13 +279,11 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	context->channels = channels;
 	context->periods = periods;
 	context->period_size = period_size;
+	context->play_buffer = memory + context_size;
 
-	context->buffer.data = memory + sizeof(struct alsa_context);
-	context->buffer.read_cursor = 0;
-	context->buffer.write_cursor = 0;
+	context->buffer.data = memory + context_size + play_buffer_size;
 	context->buffer.size = buffer_size;
 	context->buffer.frame_size = frame_size;
-	memset(context->buffer.data, 0, buffer_size * frame_size);
 
 	/* start audio thread */
 	pthread_t audio_thread;
@@ -450,7 +490,13 @@ int main()
 	XSetWMProtocols(device.display, device.window, &wm_delete_window, 1);
 
 	const int joystick_count = init_joysticks();
-	struct ring_buffer *audio_buffer = init_audio(48000, 48000);
+
+	const int base_hz = 261; /* middle c */
+	const int audio_sample_rate = 48000;
+	const int tone_half_period = (audio_sample_rate / base_hz) / 2;
+	const int16_t tone_volume = 3000;
+	unsigned int running_sample_index = 0;
+	struct ring_buffer *audio_buffer = init_audio(audio_sample_rate, audio_sample_rate);
 
 	int xoffset = 0;
 	int yoffset = 0;
@@ -488,9 +534,51 @@ int main()
 			update_joystick(0, &state);
 		}
 
-		if (pthread_mutex_trylock(&audio_buffer->mutex) == 0) {
-			/* TODO(djr): Update audio buffer */
-			pthread_mutex_unlock(&audio_buffer->mutex);
+		pthread_mutex_t *const mutex = &audio_buffer->mutex;
+		if (pthread_mutex_lock(mutex) == 0) {
+			int16_t *sample_ptr;
+			unsigned int frames_to_write;
+			unsigned int region_one_size;
+			unsigned int region_two_size;
+
+			const unsigned int buffer_size = audio_buffer->size;
+			const unsigned int frame_size = audio_buffer->frame_size;
+			const unsigned int write_cursor = audio_buffer->write_cursor;
+			const unsigned int read_cursor = audio_buffer->read_cursor;
+
+			if (write_cursor >= read_cursor) {
+				frames_to_write = buffer_size - write_cursor + read_cursor - 1;
+			} else {
+				frames_to_write = read_cursor - write_cursor - 1;
+			}
+
+			if (frames_to_write) {
+				if ((write_cursor + frames_to_write) >= buffer_size) {
+					region_one_size = buffer_size - write_cursor;
+				} else {
+					region_one_size = frames_to_write;
+				}
+
+				region_two_size = frames_to_write - region_one_size;
+
+				sample_ptr = audio_buffer->data + (write_cursor * frame_size);
+				for (unsigned int i = 0; i < region_one_size; ++i) {
+					int16_t value = ((running_sample_index++ / tone_half_period) % 2) ? tone_volume : -tone_volume;
+					*sample_ptr++ = value;
+					*sample_ptr++ = value;
+				}
+
+				sample_ptr = audio_buffer->data;
+				for (unsigned int i = 0; i < region_two_size; ++i) {
+					int16_t value = ((running_sample_index++ / tone_half_period) % 2) ? tone_volume : -tone_volume;
+					*sample_ptr++ = value;
+					*sample_ptr++ = value;
+				}
+
+				audio_buffer->write_cursor = (write_cursor + frames_to_write) % buffer_size;
+			}
+
+			pthread_mutex_unlock(mutex);
 		}
 
 		xoffset += state.x / 25;
