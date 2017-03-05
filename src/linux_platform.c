@@ -1,7 +1,7 @@
 /* standard library */
-#include <stdio.h>
 #include <stdint.h>
 #include <string.h> /* strstr() */
+#include <time.h>
 
 /* system headers */
 #include <sys/mman.h>
@@ -9,11 +9,14 @@
 #include <fcntl.h> /* open() */
 #include <unistd.h> /* read() */
 #include <libudev.h>
+#include <pthread.h>
 
 /* X11 headers */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+
+#include <alsa/asoundlib.h>
 
 struct joystick
 {
@@ -113,6 +116,154 @@ static void update_window(
 		0, 0,
 		0, 0,
 		width, height);
+}
+
+struct ring_buffer
+{
+	unsigned int size;
+	unsigned int frame_size;
+	unsigned int read_cursor;
+	unsigned int write_cursor;
+	void *data;
+	pthread_mutex_t mutex;
+};
+
+struct alsa_context
+{
+	unsigned int rate;
+	unsigned int channels;
+	unsigned int periods;
+	unsigned int period_size;
+	snd_pcm_t *pcm_handle;
+	struct ring_buffer buffer;
+};
+
+static int update_audio(struct alsa_context *context)
+{
+	static const struct timespec delay = { 0, 500000000 }; /* 0.5s */
+	(void)context;
+	nanosleep(&delay, NULL);
+	return 1;
+}
+
+static void *update_audio_thread_driver(void *context)
+{
+	printf("Starting audio thread\n");
+	while (update_audio(context));
+	printf("Audio thread stopped\n");
+	return NULL;
+}
+
+/*
+ * NOTE: So I can understand later:
+ * Sample:	  The amplitude of a single channel of sound at a point in time.
+ * Frame:		Contains a single sample per channel (Mono: 1, Stereo: 2)
+ * Frame size:	Size in bytes of a frame (8-bit Mono: 1 byte, 16-bit Stereo: 4 bytes)
+ * Rate:		Number of frames per second
+ * Period Size: How many frames that are sent in a single batch
+ * Periods:		How many batches of frames that alsa processes in one go
+ */
+static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_size)
+{
+	int status;
+	snd_pcm_t *pcm_handle;
+	snd_pcm_hw_params_t *hw_params;
+	struct alsa_context *context;
+
+	const unsigned int rate = sample_rate;
+	const unsigned int periods = 2;
+	const unsigned int channels = 2;
+	const unsigned int frame_size = 2 * sizeof(int16_t);
+	const snd_pcm_uframes_t period_size = 1024;
+
+#define ALSA_CHECK(status, msg) \
+	if (status < 0) { \
+		fprintf(stderr, "%s: %s\n", msg, snd_strerror(status)); \
+		return NULL; \
+	}
+
+	/* open connection to default pcm device in playback mode
+	 * TODO: Make this configurable
+	 */
+	status = snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+	ALSA_CHECK(status, "Unable to open default pcm device");
+
+	/* allocate struct for hardware parameters */
+	snd_pcm_hw_params_alloca(&hw_params);
+
+	/* fill hardware parameters with defaults */
+	status = snd_pcm_hw_params_any(pcm_handle, hw_params);
+	ALSA_CHECK(status, "Unable to get default hardware configuration for pcm device");
+
+	status = snd_pcm_hw_params_set_access(pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+	ALSA_CHECK(status, "Unable to set interleaved access to pcm device");
+
+	status = snd_pcm_hw_params_set_format(pcm_handle, hw_params, SND_PCM_FORMAT_S16_LE);
+	ALSA_CHECK(status, "Unable to set format for pcm device");
+
+	status = snd_pcm_hw_params_set_channels(pcm_handle, hw_params, channels);
+	ALSA_CHECK(status, "Unable to set channels for pcm device");
+
+	status = snd_pcm_hw_params_set_rate(pcm_handle, hw_params, rate, 0);
+	ALSA_CHECK(status, "Unable to set sample rate for pcm device");
+
+	status = snd_pcm_hw_params_set_period_size(pcm_handle, hw_params, period_size, 0);
+	ALSA_CHECK(status, "Unable to set period size for pcm device");
+
+	status = snd_pcm_hw_params_set_periods(pcm_handle, hw_params, periods, 0);
+	ALSA_CHECK(status, "Unable to set period count for pcm device");
+#undef ALSA_CHECK
+
+	status = snd_pcm_hw_params(pcm_handle, hw_params);
+
+	/* Check the buffer size is as expected */
+	const unsigned int expected_buffer_time = (1e6 * periods * period_size * 2) / (rate * 2);
+	unsigned int actual_buffer_time;
+	snd_pcm_hw_params_get_buffer_time(hw_params, &actual_buffer_time, 0);
+
+	assert(actual_buffer_time == expected_buffer_time);
+
+	/* allocate enough memory for the context struct and the ring buffer */
+	void *memory = malloc(sizeof(struct alsa_context) + (frame_size * buffer_size));
+
+	if (!memory) {
+		fprintf(stderr, "Unable to allocate space for ALSA context\n");
+		return NULL;
+	}
+
+	context = memory;
+	context->pcm_handle = pcm_handle;
+	context->rate = rate;
+	context->channels = channels;
+	context->periods = periods;
+	context->period_size = period_size;
+
+	context->buffer.data = memory + sizeof(struct alsa_context);
+	context->buffer.read_cursor = 0;
+	context->buffer.write_cursor = 0;
+	context->buffer.size = buffer_size;
+	context->buffer.frame_size = frame_size;
+	memset(context->buffer.data, 0, buffer_size * frame_size);
+
+	/* start audio thread */
+	pthread_t audio_thread;
+
+	status = pthread_mutex_init(&context->buffer.mutex, NULL);
+	if (status) {
+		fprintf(stderr, "Unable to create mutex for audio thread: %s\n", strerror(status));
+		free(memory);
+		return NULL;
+	}
+
+	status = pthread_create(&audio_thread, NULL, update_audio_thread_driver, context);
+	if (status) {
+		fprintf(stderr, "Unable to create audio thread: %s\n", strerror(status));
+		free(memory);
+		return NULL;
+	}
+
+	/* ready to roll! */
+	return &context->buffer;
 }
 
 static int init_joysticks()
@@ -299,6 +450,7 @@ int main()
 	XSetWMProtocols(device.display, device.window, &wm_delete_window, 1);
 
 	const int joystick_count = init_joysticks();
+	struct ring_buffer *audio_buffer = init_audio(48000, 48000);
 
 	int xoffset = 0;
 	int yoffset = 0;
@@ -334,6 +486,11 @@ int main()
 
 		if(joystick_count) {
 			update_joystick(0, &state);
+		}
+
+		if (pthread_mutex_trylock(&audio_buffer->mutex) == 0) {
+			/* TODO(djr): Update audio buffer */
+			pthread_mutex_unlock(&audio_buffer->mutex);
 		}
 
 		xoffset += state.x / 25;
