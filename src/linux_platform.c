@@ -392,8 +392,8 @@ static int init_joysticks()
 
 struct joystick_state
 {
-	float x;
-	float y;
+	float left_stick_x;
+	float left_stick_y;
 };
 
 static void update_joystick(const int index, struct joystick_state* state)
@@ -408,11 +408,11 @@ static void update_joystick(const int index, struct joystick_state* state)
 		switch (joystick_event.type & ~JS_EVENT_INIT) {
 
 			case JS_EVENT_AXIS: {
-				const float value = joystick_event.value * 100.f / 32767.f;
+				const float value = joystick_event.value / 32767.f;
 				if (joystick_event.number == 0) {
-					state->x = value;
+					state->left_stick_x = value;
 				} else if (joystick_event.number == 1) {
-					state->y = value;
+					state->left_stick_y = value;
 				}
 				break;
 			}
@@ -482,8 +482,8 @@ int main()
 
 	XStoreName(device.display, device.window, "Simple Engine");
 
+	/* Give the window a class name so i3 can float it. */
 	XClassHint class_hint = { "Handmade Engine", "GameDev" };
-
 	XSetClassHint(device.display, device.window, &class_hint);
 
 	Atom wm_delete_window = XInternAtom(device.display, "WM_DELETE_WINDOW", False);
@@ -493,9 +493,7 @@ int main()
 
 	const int base_hz = 261; /* middle c */
 	const int audio_sample_rate = 48000;
-	const int tone_half_period = (audio_sample_rate / base_hz) / 2;
-	const int16_t tone_volume = 3000;
-	unsigned int running_sample_index = 0;
+	const int16_t tone_volume = 6000;
 	struct ring_buffer *audio_buffer = init_audio(audio_sample_rate, audio_sample_rate);
 
 	int xoffset = 0;
@@ -541,52 +539,62 @@ int main()
 			unsigned int region_one_size;
 			unsigned int region_two_size;
 
+			static float t = 0;
+			static unsigned int running_sample_index = 0;
+
 			const unsigned int buffer_size = audio_buffer->size;
 			const unsigned int frame_size = audio_buffer->frame_size;
-			const unsigned int write_cursor = audio_buffer->write_cursor;
 			const unsigned int read_cursor = audio_buffer->read_cursor;
+			const unsigned int sample_index = running_sample_index % buffer_size;
+			const unsigned int latency = buffer_size / 60;
+			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
 
-			if (write_cursor >= read_cursor) {
-				frames_to_write = buffer_size - write_cursor + read_cursor - 1;
+			const int tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz / 4);
+			const int wave_period = audio_sample_rate / tone_hz;
+			const int pi = 3.14159265359f;
+
+			if (sample_index > target_cursor) {
+				frames_to_write = buffer_size - sample_index + target_cursor;
 			} else {
-				frames_to_write = read_cursor - write_cursor - 1;
+				frames_to_write = target_cursor - sample_index;
 			}
 
 			if (frames_to_write) {
-				if ((write_cursor + frames_to_write) >= buffer_size) {
-					region_one_size = buffer_size - write_cursor;
+				if ((sample_index + frames_to_write) >= buffer_size) {
+					region_one_size = buffer_size - sample_index;
 				} else {
 					region_one_size = frames_to_write;
 				}
 
 				region_two_size = frames_to_write - region_one_size;
 
-				sample_ptr = audio_buffer->data + (write_cursor * frame_size);
+				sample_ptr = audio_buffer->data + (sample_index * frame_size);
 				for (unsigned int i = 0; i < region_one_size; ++i) {
-					int16_t value = ((running_sample_index++ / tone_half_period) % 2) ? tone_volume : -tone_volume;
+					const int16_t value = sinf(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
+					t += (2.0f * pi) / wave_period;
+					++running_sample_index;
 				}
 
 				sample_ptr = audio_buffer->data;
 				for (unsigned int i = 0; i < region_two_size; ++i) {
-					int16_t value = ((running_sample_index++ / tone_half_period) % 2) ? tone_volume : -tone_volume;
+					const int16_t value = sinf(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
+					t += (2.0f * pi) / wave_period;
+					++running_sample_index;
 				}
 
-				audio_buffer->write_cursor = (write_cursor + frames_to_write) % buffer_size;
 			}
-
+			audio_buffer->write_cursor = target_cursor;
 			pthread_mutex_unlock(mutex);
 		}
 
-		xoffset += state.x / 25;
-		yoffset += state.y / 25;
+		xoffset += state.left_stick_x * 5 + 1;
+		yoffset += state.left_stick_y * 5 + 1;
 
 		update_window(&device, xoffset, yoffset);
-		xoffset += 1;
-		yoffset += 1;
 	}
 
 	XCloseDisplay(device.display);
