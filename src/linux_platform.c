@@ -16,9 +16,13 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <X11/extensions/XShm.h>
 
 #include <alsa/asoundlib.h>
 
+#define USE_MIT_SHM
 #define MIN(x, y) (x) < (y) ? (x) : (y)
 
 struct joystick
@@ -38,7 +42,8 @@ struct offscreen_buffer
 
 struct x11_device
 {
-	XImage ximage;
+	XImage *ximage;
+	XShmSegmentInfo *shm;
 	XVisualInfo vinfo;
 	struct offscreen_buffer backbuffer;
 	Display *display;
@@ -50,42 +55,87 @@ struct x11_device
 	int height;
 };
 
+static void destroy_shm(struct x11_device *device)
+{
+#ifdef USE_MIT_SHM
+	if (device->shm) {
+		XShmDetach(device->display, device->shm);
+		XDestroyImage(device->ximage);
+		shmdt(device->shm->shmaddr);
+		shmctl(device->shm->shmid, IPC_RMID, 0);
+	}
+#endif
+}
+
 static void resize_ximage(
 	struct x11_device *device,
 	int width, int height)
 {
-	const size_t new_buffer_size = width * height * 4;
+	if (device->width == width && device->height == height)
+		return;
 
-	if (new_buffer_size > device->backbuffer.buffer_size) {
-		munmap(device->backbuffer.pixels, device->backbuffer.buffer_size);
-		device->backbuffer.pixels = mmap(
-				NULL, new_buffer_size,
-				PROT_READ | PROT_WRITE,
-				MAP_ANONYMOUS | MAP_PRIVATE,
-				-1, 0);
-
-		device->backbuffer.buffer_size = new_buffer_size;
+#ifdef USE_MIT_SHM
+	if (!device->shm) {
+		device->shm = malloc(sizeof(XShmSegmentInfo));
 	}
 
+	if (device->ximage) {
+		destroy_shm(device);
+	}
+
+	device->ximage = XShmCreateImage(
+		device->display,
+		device->vinfo.visual,
+		device->vinfo.depth,
+		ZPixmap,
+		NULL,
+		device->shm,
+		width,
+		height);
+
+	assert(device->ximage);
+
+	device->shm->shmid = shmget(
+		IPC_PRIVATE,
+		device->ximage->bytes_per_line * height,
+		IPC_CREAT|0777);
+
+	device->shm->shmaddr = device->ximage->data = shmat(device->shm->shmid, 0, 0);
+	memset(device->shm->shmaddr, 255, device->ximage->bytes_per_line * height);
+
+	device->shm->readOnly = False;
+	XShmAttach(device->display, device->shm);
+
+	device->backbuffer.pixels = device->shm->shmaddr;
+	device->backbuffer.buffer_size = device->ximage->bytes_per_line * height;
 	device->width = width;
 	device->height = height;
-	device->ximage.width = width;
-	device->ximage.height = height;
-	device->ximage.format = ZPixmap;
-	device->ximage.byte_order = XImageByteOrder(device->display);
-	device->ximage.bitmap_unit = XBitmapUnit(device->display);
-	device->ximage.bitmap_bit_order = XBitmapBitOrder(device->display);
-	device->ximage.red_mask = device->vinfo.visual->red_mask;
-	device->ximage.blue_mask = device->vinfo.visual->blue_mask;
-	device->ximage.green_mask = device->vinfo.visual->green_mask;
-	device->ximage.xoffset = 0;
-	device->ximage.bitmap_pad = 32;
-	device->ximage.depth = device->vinfo.depth;
-	device->ximage.data = device->backbuffer.pixels;
-	device->ximage.bits_per_pixel = 32;
-	device->ximage.bytes_per_line = 0;
 
-	XInitImage(&device->ximage);
+#else
+	const size_t new_buffer_size = width * height * 4;
+
+	if (device->ximage)
+		XDestroyImage(device->ximage);
+
+	device->backbuffer.pixels = malloc(new_buffer_size);
+	device->backbuffer.buffer_size = new_buffer_size;
+	device->width = width;
+	device->height = height;
+
+	device->ximage = XCreateImage(
+		device->display,
+		device->vinfo.visual,
+		device->vinfo.depth,
+		ZPixmap,
+		0,
+		device->backbuffer.pixels,
+		width,
+		height,
+		32,
+		width * 4);
+
+	assert(device->ximage);
+#endif
 }
 
 static void update_window(
@@ -113,12 +163,23 @@ static void update_window(
 		row += pitch;
 	}
 
+#ifndef USE_MIT_SHIM
 	XPutImage(
 		device->display, device->window,
-		device->gc, &device->ximage,
+		device->gc, device->ximage,
 		0, 0,
 		0, 0,
 		width, height);
+#else
+	XShmPutImage(
+		device->display, device->window,
+		device->gc, device->ximage,
+		0, 0,
+		0, 0,
+		width, height,
+		False);
+	XSync(device->display, False);
+#endif
 }
 
 struct ring_buffer
@@ -475,11 +536,13 @@ int main()
 {
 	XInitThreads();
 
-	int width = 1600;
-	int height = 900;
+	int width = 1280;
+	int height = 720;
 
 	static struct x11_device device;
 	device.display = XOpenDisplay(NULL);
+
+	assert(True == XShmQueryExtension(device.display));
 
 	if (!device.display) {
 		/* TODO(djr): Logging */
@@ -538,6 +601,8 @@ int main()
 	Atom wm_delete_window = XInternAtom(device.display, "WM_DELETE_WINDOW", False);
 	XSetWMProtocols(device.display, device.window, &wm_delete_window, 1);
 
+	resize_ximage(&device, width, height);
+
 	const int joystick_count = init_joysticks();
 
 	const int base_hz = 261; /* middle c */
@@ -552,8 +617,9 @@ int main()
 
 	int xoffset = 0;
 	int yoffset = 0;
-
 	int running = 1;
+	int do_resize = 0;
+	int frames_since_resize = 0;
 	while(running) {
 		XEvent e;
 		while(XPending(device.display)) {
@@ -570,15 +636,22 @@ int main()
 					}
 					break;
 				case ConfigureNotify:
+					do_resize = 1;
+					frames_since_resize = 0;
 					width = e.xconfigure.width;
 					height = e.xconfigure.height;
-					resize_ximage(&device, width, height);
 					break;
 				case Expose:
 					break;
 				default:
 					printf("Unhandled XEvent (%d)\n", e.type);
 			}
+		}
+
+		/* delay resize until there hasn't been a resize event 5 frames */
+		if (do_resize && ++frames_since_resize > 5) {
+			resize_ximage(&device, width, height);
+			do_resize = 0;
 		}
 
 		if(joystick_count) {
@@ -668,6 +741,7 @@ int main()
 		t_start = t_end;
 	}
 
+	destroy_shm(&device);
 	XCloseDisplay(device.display);
 	return 0;
 }
