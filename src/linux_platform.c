@@ -127,6 +127,7 @@ struct ring_buffer
 	unsigned int frame_size;
 	unsigned int read_cursor;
 	unsigned int write_cursor;
+	unsigned int target_latency;
 	void *data;
 	pthread_mutex_t mutex;
 };
@@ -171,9 +172,55 @@ static int update_audio(struct alsa_context *context)
 		pthread_mutex_unlock(mutex);
 
 		if (frames_to_write) {
-			snd_pcm_writei(context->pcm_handle, context->play_buffer, frames_to_write);
+			snd_pcm_uframes_t frames_left = frames_to_write;
+			const int16_t *play_buffer = context->play_buffer;
+
+			while (frames_left > 0) {
+				int status;
+
+				status = snd_pcm_writei(
+					context->pcm_handle,
+					play_buffer,
+					frames_left);
+
+
+				/* TODO(djr): logging */
+				if (status < 0) {
+					if (status == -EAGAIN) {
+						const struct timespec delay = { 0, 1000L }; /* 1ms */
+						nanosleep(&delay, NULL);
+						continue;
+					}
+
+					/* TODO(djr): Find a better way to handle this error */
+					if (status == -EPIPE) {
+						/* underrun detected, increase latency and silence play_buffer */
+						pthread_mutex_lock(mutex);
+						const unsigned int latency = buffer->target_latency;
+						memset(context->play_buffer, 0, frames_left * frame_size);
+						buffer->target_latency += latency / 10;
+						fprintf(stderr, "audio latency increased: %d -> %d\n", latency, buffer->target_latency);
+						pthread_mutex_unlock(mutex);
+					}
+
+					status = snd_pcm_recover(context->pcm_handle, status, 0);
+
+					if (status < 0) {
+						fprintf(stderr, "alsa unable to recover\n");
+						return 0; /* kill audio thread */
+					}
+
+					/* successfully recovered */
+					continue;
+				}
+
+				play_buffer += status * frame_size;
+				frames_left -= status;
+			}
+
+
 		} else {
-			const struct timespec delay = { 0, 10000L }; /* 10ms */
+			const struct timespec delay = { 0, 16000L }; /* 16ms */
 			nanosleep(&delay, NULL);
 		}
 	}
@@ -206,10 +253,11 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	struct alsa_context *context;
 
 	const unsigned int rate = sample_rate;
-	const unsigned int periods = 2;
 	const unsigned int channels = 2;
 	const unsigned int frame_size = 2 * sizeof(int16_t);
 	const snd_pcm_uframes_t period_size = 1024;
+
+	unsigned int periods = 2;
 
 #define ALSA_CHECK(status, msg) \
 	if (status < 0) { \
@@ -245,7 +293,7 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	status = snd_pcm_hw_params_set_period_size(pcm_handle, hw_params, period_size, 0);
 	ALSA_CHECK(status, "Unable to set period size for pcm device");
 
-	status = snd_pcm_hw_params_set_periods(pcm_handle, hw_params, periods, 0);
+	status = snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, 0);
 	ALSA_CHECK(status, "Unable to set period count for pcm device");
 #undef ALSA_CHECK
 
@@ -284,6 +332,7 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	context->buffer.data = memory + context_size + play_buffer_size;
 	context->buffer.size = buffer_size;
 	context->buffer.frame_size = frame_size;
+	context->buffer.target_latency = buffer_size / 60;
 
 	/* start audio thread */
 	pthread_t audio_thread;
@@ -545,8 +594,8 @@ int main()
 			const unsigned int buffer_size = audio_buffer->size;
 			const unsigned int frame_size = audio_buffer->frame_size;
 			const unsigned int read_cursor = audio_buffer->read_cursor;
+			const unsigned int latency = audio_buffer->target_latency;
 			const unsigned int sample_index = running_sample_index % buffer_size;
-			const unsigned int latency = buffer_size / 60;
 			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
 
 			const int tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz / 4);
