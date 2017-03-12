@@ -590,6 +590,7 @@ int main()
 
 			static double t = 0;
 			static unsigned int running_sample_index = 0;
+			static float previous_tone_hz = 0;
 
 			const unsigned int buffer_size = audio_buffer->size;
 			const unsigned int frame_size = audio_buffer->frame_size;
@@ -598,9 +599,8 @@ int main()
 			const unsigned int sample_index = running_sample_index % buffer_size;
 			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
 
-			const int tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz / 4);
-			const double wave_period = (double)audio_sample_rate / tone_hz;
-			const int pi = 3.14159265359f;
+			const float tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz);
+			const float tone_diff = tone_hz - previous_tone_hz;
 
 			if (sample_index > target_cursor) {
 				frames_to_write = buffer_size - sample_index + target_cursor;
@@ -609,6 +609,9 @@ int main()
 			}
 
 			if (frames_to_write) {
+				const float tone_step = tone_diff / frames_to_write;
+				float curr_hz = previous_tone_hz;
+
 				if ((sample_index + frames_to_write) >= buffer_size) {
 					region_one_size = buffer_size - sample_index;
 				} else {
@@ -619,23 +622,28 @@ int main()
 
 				sample_ptr = audio_buffer->data + (sample_index * frame_size);
 				for (unsigned int i = 0; i < region_one_size; ++i) {
-					const int16_t value = sin(t) * tone_volume;
+					const double wave_period = audio_sample_rate / curr_hz;
+					const int16_t value = sinf(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
-					t += (2.0f * pi) / wave_period;
+					t += (2.0f * M_PI) / wave_period;
+					curr_hz += tone_step;
 					++running_sample_index;
 				}
 
 				sample_ptr = audio_buffer->data;
 				for (unsigned int i = 0; i < region_two_size; ++i) {
-					const int16_t value = sin(t) * tone_volume;
+					const double wave_period = audio_sample_rate / curr_hz;
+					const int16_t value = sinf(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
-					t += (2.0f * pi) / wave_period;
+					t += (2.0f * M_PI) / wave_period;
+					curr_hz += tone_step;
 					++running_sample_index;
 				}
 
 			}
+			previous_tone_hz = tone_hz;
 			audio_buffer->write_cursor = target_cursor;
 			pthread_mutex_unlock(mutex);
 		}
