@@ -545,11 +545,15 @@ int main()
 	const int16_t tone_volume = 6000;
 	struct ring_buffer *audio_buffer = init_audio(audio_sample_rate, audio_sample_rate);
 
+	struct joystick_state state = {0};
+
+	struct timespec t_start;
+	clock_gettime(CLOCK_REALTIME, &t_start);
+
 	int xoffset = 0;
 	int yoffset = 0;
 
 	int running = 1;
-	struct joystick_state state = {0};
 	while(running) {
 		XEvent e;
 		while(XPending(device.display)) {
@@ -652,6 +656,16 @@ int main()
 		yoffset += state.left_stick_y * 5 + 1;
 
 		update_window(&device, xoffset, yoffset);
+
+		struct timespec t_end;
+		clock_gettime(CLOCK_REALTIME, &t_end);
+		long t_delta = t_end.tv_nsec - t_start.tv_nsec;
+
+		if (t_delta > 0) {
+			printf("\r%4.2f ms, %4.2f fps", t_delta * 1e-6, 1 / (t_delta * 1e-9));
+		}
+
+		t_start = t_end;
 	}
 
 	XCloseDisplay(device.display);
