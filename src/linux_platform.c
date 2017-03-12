@@ -17,6 +17,9 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
+/* XCB headers */
+#include <xcb/xcb.h>
+
 #include <alsa/asoundlib.h>
 
 #define MIN(x, y) (x) < (y) ? (x) : (y)
@@ -471,12 +474,87 @@ static void update_joystick(const int index, struct joystick_state* state)
 	}
 }
 
+static int init_video(int width, int height)
+{
+	int default_screen;
+	const xcb_setup_t *setup;
+	xcb_connection_t *connection;
+	xcb_screen_t *screen;
+	xcb_screen_iterator_t iter;
+
+	connection = xcb_connect(NULL, &default_screen);
+	setup = xcb_get_setup(connection);
+
+	/* TODO(djr): iterator through all screens to find default */
+	iter = xcb_setup_roots_iterator(setup);
+	screen = iter.data;
+
+	printf("\n");
+	printf("Screen Information:\n");
+	printf("\twidth (px) : %d\n", screen->width_in_pixels);
+	printf("\theight (px): %d\n", screen->height_in_pixels);
+	printf("\twidth (mm) : %d\n", screen->width_in_millimeters);
+	printf("\theight (mm): %d\n", screen->height_in_millimeters);
+	printf("\tdepth      : %d\n", screen->root_depth);
+	printf("\twhite pixel: %d\n", screen->white_pixel);
+	printf("\tblack pixel: %d\n", screen->black_pixel);
+	printf("\n");
+
+	xcb_window_t window = xcb_generate_id(connection);
+	char class[] = "Handmade Engine\0GameDev";
+	uint32_t w_mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK;
+	uint32_t w_values[] = { screen->black_pixel, XCB_NONE, XCB_EVENT_MASK_KEY_PRESS };
+	xcb_create_window(
+			connection,
+			XCB_COPY_FROM_PARENT,
+			window,
+			screen->root,
+			0, 0,
+			width, height,
+			0, /* border width */
+			XCB_WINDOW_CLASS_INPUT_OUTPUT,
+			screen->root_visual,
+			w_mask,
+			w_values);
+
+	xcb_map_window(connection, window);
+
+	xcb_change_property(
+			connection,
+			XCB_PROP_MODE_REPLACE,
+			window,
+			XCB_ATOM_WM_CLASS,
+			XCB_ATOM_STRING,
+			8, sizeof(class),
+			class);
+
+	/* gotta flush to wait for previous requests to finish */
+	xcb_flush(connection);
+	
+	int running = 1;
+
+	xcb_generic_event_t *event;
+
+	while (running) {
+		while ((event = xcb_poll_for_event(connection))) {
+			switch (event->response_type) {
+				case XCB_KEY_PRESS: {
+					xcb_key_press_event_t *e = event;
+				}
+			}
+			free(event);
+		}
+	}
+	
+	return 0;
+}
+
 int main()
 {
-	XInitThreads();
-
 	int width = 1600;
 	int height = 900;
+	
+	assert(init_video(width, height));
 
 	static struct x11_device device;
 	device.display = XOpenDisplay(NULL);
@@ -499,8 +577,7 @@ int main()
 	Colormap colormap = XCreateColormap(
 			device.display, device.root, device.vinfo.visual, AllocNone);
 
-	const unsigned long wamask = CWBorderPixel | CWBackPixel | CWColormap | CWEventMask;
-
+	const unsigned long wamask = CWBorderPixel | CWBackPixel | CWColormap | CWEventMask; 
 	XSetWindowAttributes wa;
 	wa.colormap = colormap;
 	wa.background_pixel = BlackPixel(device.display, device.screen);
@@ -525,7 +602,6 @@ int main()
 		return -1;
 	}
 
-	XMapWindow(device.display, device.window);
 
 	device.gc = XCreateGC(device.display, device.window, 0, NULL);
 
@@ -550,11 +626,11 @@ int main()
 
 	int running = 1;
 	struct joystick_state state = {0};
-	while(running) {
+	while (running) {
 		XEvent e;
-		while(XPending(device.display)) {
+		while (XPending(device.display)) {
 			XNextEvent(device.display, &e);
-			switch(e.type) {
+			switch (e.type) {
 				case ClientMessage:
 					if (((Atom)e.xclient.data.l[0] == wm_delete_window)) {
 						running = 0;
@@ -577,7 +653,7 @@ int main()
 			}
 		}
 
-		if(joystick_count) {
+		if (joystick_count) {
 			update_joystick(0, &state);
 		}
 

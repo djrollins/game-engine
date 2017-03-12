@@ -7,5 +7,5 @@ if [[ ! -d build ]]; then
 fi
 
 pushd build > /dev/null
-gcc -g -std=gnu99 -O3 -lX11 -lm -ludev -lasound -lpthread -Wall -Wextra -o game ../src/linux_platform.c
+gcc -g -std=gnu99 -O3 -lX11 -lxcb -lm -ludev -lasound -lpthread -Wall -Wextra -o game ../src/linux_platform.c
 popd > /dev/null
