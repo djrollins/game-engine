@@ -588,7 +588,7 @@ int main()
 			unsigned int region_one_size;
 			unsigned int region_two_size;
 
-			static float t = 0;
+			static double t = 0;
 			static unsigned int running_sample_index = 0;
 
 			const unsigned int buffer_size = audio_buffer->size;
@@ -599,7 +599,7 @@ int main()
 			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
 
 			const int tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz / 4);
-			const int wave_period = audio_sample_rate / tone_hz;
+			const double wave_period = (double)audio_sample_rate / tone_hz;
 			const int pi = 3.14159265359f;
 
 			if (sample_index > target_cursor) {
@@ -619,7 +619,7 @@ int main()
 
 				sample_ptr = audio_buffer->data + (sample_index * frame_size);
 				for (unsigned int i = 0; i < region_one_size; ++i) {
-					const int16_t value = sinf(t) * tone_volume;
+					const int16_t value = sin(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
 					t += (2.0f * pi) / wave_period;
@@ -628,7 +628,7 @@ int main()
 
 				sample_ptr = audio_buffer->data;
 				for (unsigned int i = 0; i < region_two_size; ++i) {
-					const int16_t value = sinf(t) * tone_volume;
+					const int16_t value = sin(t) * tone_volume;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
 					t += (2.0f * pi) / wave_period;
