@@ -752,7 +752,19 @@ int main()
 		long t_delta = t_end.tv_nsec - t_start.tv_nsec;
 
 		if (t_delta > 0) {
-			printf("\r%4.2f ms, %4.2f fps", t_delta * 1e-6, 1 / (t_delta * 1e-9));
+			const int sample_count = 120;
+			static int report_delay = sample_count;
+			static long t_avg = 0;
+
+			if (!report_delay--) {
+				t_avg /= sample_count;
+				printf("\r%4.2f ms, %4.2f fps", t_avg * 1e-6, 1 / (t_avg * 1e-9));
+				report_delay = sample_count;
+				t_avg = 0;
+			} else {
+				t_avg += t_delta;
+				fflush(stdout);
+			}
 		}
 
 		t_start = t_end;
