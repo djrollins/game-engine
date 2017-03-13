@@ -22,6 +22,8 @@
 
 #include <alsa/asoundlib.h>
 
+#include "platform.h"
+
 #define USE_MIT_SHM
 #define MIN(x, y) (x) < (y) ? (x) : (y)
 
@@ -34,12 +36,6 @@ struct joystick
 
 static struct joystick *joysticks;
 
-struct offscreen_buffer
-{
-	void *pixels;
-	size_t buffer_size;
-};
-
 struct x11_device
 {
 	XImage *ximage;
@@ -51,8 +47,6 @@ struct x11_device
 	GC gc;
 	int root;
 	int screen;
-	int width;
-	int height;
 };
 
 static void destroy_shm(struct x11_device *device)
@@ -69,9 +63,9 @@ static void destroy_shm(struct x11_device *device)
 
 static void resize_ximage(
 	struct x11_device *device,
-	int width, int height)
+	unsigned int width, unsigned int height)
 {
-	if (device->width == width && device->height == height)
+	if (device->backbuffer.width == width && device->backbuffer.height == height)
 		return;
 
 #ifdef USE_MIT_SHM
@@ -107,9 +101,9 @@ static void resize_ximage(
 	XShmAttach(device->display, device->shm);
 
 	device->backbuffer.pixels = device->shm->shmaddr;
-	device->backbuffer.buffer_size = device->ximage->bytes_per_line * height;
-	device->width = width;
-	device->height = height;
+	device->backbuffer.width = width;
+	device->backbuffer.height = height;
+	device->backbuffer.pitch = device->ximage->bytes_per_line;
 
 #else
 	const size_t new_buffer_size = width * height * 4;
@@ -118,9 +112,10 @@ static void resize_ximage(
 		XDestroyImage(device->ximage);
 
 	device->backbuffer.pixels = malloc(new_buffer_size);
-	device->backbuffer.buffer_size = new_buffer_size;
-	device->width = width;
-	device->height = height;
+	device->backbuffer.width = width;
+	device->backbuffer.height = height;
+	device->backbuffer.pitch = bytes_per_line;
+
 
 	device->ximage = XCreateImage(
 		device->display,
@@ -138,28 +133,8 @@ static void resize_ximage(
 #endif
 }
 
-static void update_window(
-	struct x11_device *device,
-	int xoffset, int yoffset)
+static void update_window(struct x11_device *device)
 {
-	const int width = device->width;
-	const int height = device->height;
-	const int pitch = device->width * 4;
-
-	uint8_t *row = (uint8_t*)device->backbuffer.pixels;
-	for (int y = 0; y < height; ++y) {
-		uint32_t *pixel = (uint32_t*)row;
-		for (int x = 0; x < width; ++x) {
-			uint8_t blue  = (x + xoffset);
-			uint8_t green = (y + yoffset);
-			uint8_t red   = 0;
-			uint8_t alpha = 255;
-
-			*pixel++ = (alpha << 24) | (red << 16) | (green << 8) | blue;
-		}
-		row += pitch;
-	}
-
 	/* find out window size to centralise
 	 * image rather than resize backbuffer
 	 */
@@ -183,8 +158,8 @@ static void update_window(
 		&winattrs.border_width,
 		&winattrs.depth);
 
-	int x = (winattrs.w - width) / 2;
-	int y = (winattrs.h - height) / 2;
+	int x = (winattrs.w - device->backbuffer.width) / 2;
+	int y = (winattrs.h - device->backbuffer.height) / 2;
 
 #ifndef USE_MIT_SHIM
 	XPutImage(
@@ -192,14 +167,16 @@ static void update_window(
 		device->gc, device->ximage,
 		0, 0,
 		x, y,
-		width, height);
+		device->backbuffer.width,
+		device->backbuffer.height);
 #else
 	XShmPutImage(
 		device->display, device->window,
 		device->gc, device->ximage,
 		0, 0,
 		x, y,
-		width, height,
+		device->backbuffer.width
+		device->backbuffer.height,
 		False);
 	XSync(device->display, False);
 #endif
@@ -745,7 +722,8 @@ int main()
 		xoffset += state.left_stick_x * 5 + 1;
 		yoffset += state.left_stick_y * 5 + 1;
 
-		update_window(&device, xoffset, yoffset);
+		render(&device.backbuffer, xoffset, yoffset);
+		update_window(&device);
 
 		struct timespec t_end;
 		clock_gettime(CLOCK_REALTIME, &t_end);
