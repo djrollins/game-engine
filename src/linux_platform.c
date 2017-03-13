@@ -146,9 +146,6 @@ static void update_window(
 	const int height = device->height;
 	const int pitch = device->width * 4;
 
-	if (!device->backbuffer.pixels)
-		resize_ximage(device, width, height);
-
 	uint8_t *row = (uint8_t*)device->backbuffer.pixels;
 	for (int y = 0; y < height; ++y) {
 		uint32_t *pixel = (uint32_t*)row;
@@ -163,19 +160,45 @@ static void update_window(
 		row += pitch;
 	}
 
+	/* find out window size to centralise
+	 * image rather than resize backbuffer
+	 */
+	struct {
+		Window root;
+		int x;
+		int y;
+		unsigned int w;
+		unsigned int h;
+		unsigned int border_width;
+		unsigned int depth;
+	} winattrs;
+
+	XGetGeometry(
+		device->display, device->window,
+		&winattrs.root,
+		&winattrs.x,
+		&winattrs.y,
+		&winattrs.w,
+		&winattrs.h,
+		&winattrs.border_width,
+		&winattrs.depth);
+
+	int x = (winattrs.w - width) / 2;
+	int y = (winattrs.h - height) / 2;
+
 #ifndef USE_MIT_SHIM
 	XPutImage(
 		device->display, device->window,
 		device->gc, device->ximage,
 		0, 0,
-		0, 0,
+		x, y,
 		width, height);
 #else
 	XShmPutImage(
 		device->display, device->window,
 		device->gc, device->ximage,
 		0, 0,
-		0, 0,
+		x, y,
 		width, height,
 		False);
 	XSync(device->display, False);
@@ -601,6 +624,11 @@ int main()
 	Atom wm_delete_window = XInternAtom(device.display, "WM_DELETE_WINDOW", False);
 	XSetWMProtocols(device.display, device.window, &wm_delete_window, 1);
 
+	XSizeHints size_hints;
+	size_hints.flags = PMinSize | PMaxSize;
+	size_hints.min_width = size_hints.max_width = width;
+	size_hints.min_height = size_hints.max_height = height;
+
 	resize_ximage(&device, width, height);
 
 	const int joystick_count = init_joysticks();
@@ -618,8 +646,7 @@ int main()
 	int xoffset = 0;
 	int yoffset = 0;
 	int running = 1;
-	int do_resize = 0;
-	int frames_since_resize = 0;
+
 	while(running) {
 		XEvent e;
 		while(XPending(device.display)) {
@@ -636,22 +663,12 @@ int main()
 					}
 					break;
 				case ConfigureNotify:
-					do_resize = 1;
-					frames_since_resize = 0;
-					width = e.xconfigure.width;
-					height = e.xconfigure.height;
 					break;
 				case Expose:
 					break;
 				default:
 					printf("Unhandled XEvent (%d)\n", e.type);
 			}
-		}
-
-		/* delay resize until there hasn't been a resize event 5 frames */
-		if (do_resize && ++frames_since_resize > 5) {
-			resize_ximage(&device, width, height);
-			do_resize = 0;
 		}
 
 		if(joystick_count) {
