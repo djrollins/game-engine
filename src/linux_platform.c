@@ -306,7 +306,8 @@ static void *update_audio_thread_driver(void *context)
  * Period Size: How many frames that are sent in a single batch
  * Periods:		How many batches of frames that alsa processes in one go
  */
-static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_size)
+static struct ring_buffer *init_audio(
+	unsigned int sample_rate, unsigned int buffer_size, unsigned int latency)
 {
 	int status;
 	snd_pcm_t *pcm_handle;
@@ -316,7 +317,6 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	const unsigned int rate = sample_rate;
 	const unsigned int channels = 2;
 	const unsigned int frame_size = 2 * sizeof(int16_t);
-	const snd_pcm_uframes_t period_size = 1024;
 
 	unsigned int periods = 2;
 
@@ -351,11 +351,12 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	status = snd_pcm_hw_params_set_rate(pcm_handle, hw_params, rate, 0);
 	ALSA_CHECK(status, "Unable to set sample rate for pcm device");
 
-	status = snd_pcm_hw_params_set_period_size(pcm_handle, hw_params, period_size, 0);
-	ALSA_CHECK(status, "Unable to set period size for pcm device");
-
 	status = snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, 0);
 	ALSA_CHECK(status, "Unable to set period count for pcm device");
+
+	snd_pcm_uframes_t period_size = latency/periods;
+	status = snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, 0);
+	ALSA_CHECK(status, "Unable to set period size for pcm device");
 #undef ALSA_CHECK
 
 	status = snd_pcm_hw_params(pcm_handle, hw_params);
@@ -393,7 +394,7 @@ static struct ring_buffer *init_audio(unsigned int sample_rate, unsigned buffer_
 	context->buffer.data = memory + context_size + play_buffer_size;
 	context->buffer.size = buffer_size;
 	context->buffer.frame_size = frame_size;
-	context->buffer.target_latency = buffer_size / 60;
+	context->buffer.target_latency = latency;
 
 	/* start audio thread */
 	pthread_t audio_thread;
@@ -504,6 +505,8 @@ struct joystick_state
 {
 	float left_stick_x;
 	float left_stick_y;
+	int a;
+	int b;
 };
 
 static void update_joystick(const int index, struct joystick_state* state)
@@ -523,6 +526,18 @@ static void update_joystick(const int index, struct joystick_state* state)
 					state->left_stick_x = value;
 				} else if (joystick_event.number == 1) {
 					state->left_stick_y = value;
+				}
+				break;
+			}
+
+			case JS_EVENT_BUTTON: {
+				switch (joystick_event.number) {
+					case 0: state->a = joystick_event.value; break;
+					case 1: state->b = joystick_event.value; break;
+					default: {
+						printf("%d %s\n", joystick_event.number,
+								joystick_event.value ? "pressed" : "released");
+					}
 				}
 				break;
 			}
@@ -613,7 +628,8 @@ int main()
 	const int base_hz = 261; /* middle c */
 	const int audio_sample_rate = 48000;
 	const int16_t tone_volume = 6000;
-	struct ring_buffer *audio_buffer = init_audio(audio_sample_rate, audio_sample_rate);
+	struct ring_buffer *audio_buffer = init_audio(
+			audio_sample_rate, audio_sample_rate, audio_sample_rate / 60);
 
 	struct joystick_state state = {0};
 
@@ -652,6 +668,10 @@ int main()
 			update_joystick(0, &state);
 		}
 
+		if (state.b) {
+			running = 0;
+		}
+
 		pthread_mutex_t *const mutex = &audio_buffer->mutex;
 		if (pthread_mutex_lock(mutex) == 0) {
 			int16_t *sample_ptr;
@@ -670,7 +690,7 @@ int main()
 			const unsigned int sample_index = running_sample_index % buffer_size;
 			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
 
-			const float tone_hz = base_hz + ((state.left_stick_x + state.left_stick_y) * base_hz);
+			const float tone_hz = base_hz + ((state.left_stick_x - state.left_stick_y) * base_hz / 4);
 			const float tone_diff = tone_hz - previous_tone_hz;
 
 			if (sample_index > target_cursor) {
@@ -694,7 +714,7 @@ int main()
 				sample_ptr = audio_buffer->data + (sample_index * frame_size);
 				for (unsigned int i = 0; i < region_one_size; ++i) {
 					const double wave_period = audio_sample_rate / curr_hz;
-					const int16_t value = sinf(t) * tone_volume;
+					const int16_t value = sinf(t) * tone_volume * state.a;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
 					t += (2.0f * M_PI) / wave_period;
@@ -705,7 +725,7 @@ int main()
 				sample_ptr = audio_buffer->data;
 				for (unsigned int i = 0; i < region_two_size; ++i) {
 					const double wave_period = audio_sample_rate / curr_hz;
-					const int16_t value = sinf(t) * tone_volume;
+					const int16_t value = sinf(t) * tone_volume * state.a;
 					*sample_ptr++ = value;
 					*sample_ptr++ = value;
 					t += (2.0f * M_PI) / wave_period;
@@ -719,8 +739,8 @@ int main()
 			pthread_mutex_unlock(mutex);
 		}
 
-		xoffset += state.left_stick_x * 5 + 1;
-		yoffset += state.left_stick_y * 5 + 1;
+		xoffset -= state.left_stick_x * 5;
+		yoffset -= state.left_stick_y * 5;
 
 		render(&device.backbuffer, xoffset, yoffset);
 		update_window(&device);
@@ -730,7 +750,7 @@ int main()
 		long t_delta = t_end.tv_nsec - t_start.tv_nsec;
 
 		if (t_delta > 0) {
-			const int sample_count = 120;
+			const int sample_count = 60;
 			static int report_delay = sample_count;
 			static long t_avg = 0;
 
