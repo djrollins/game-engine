@@ -6,41 +6,40 @@
 
 #include "../video.h"
 
-const char *xcb_errors[] =
-{
-    "Success",
-    "BadRequest",
-    "BadValue",
-    "BadWindow",
-    "BadPixmap",
-    "BadAtom",
-    "BadCursor",
-    "BadFont",
-    "BadMatch",
-    "BadDrawable",
-    "BadAccess",
-    "BadAlloc",
-    "BadColor",
-    "BadGC",
-    "BadIDChoice",
-    "BadName",
-    "BadLength",
-    "BadImplementation",
-    "Unknown"
+const char *xcb_errors[] = {
+	"Success",
+	"BadRequest",
+	"BadValue",
+	"BadWindow",
+	"BadPixmap",
+	"BadAtom",
+	"BadCursor",
+	"BadFont",
+	"BadMatch",
+	"BadDrawable",
+	"BadAccess",
+	"BadAlloc",
+	"BadColor",
+	"BadGC",
+	"BadIDChoice",
+	"BadName",
+	"BadLength",
+	"BadImplementation",
+	"Unknown"
 };
 
-struct xcb
-{
+struct xcb {
 	xcb_connection_t *connection;
 	xcb_screen_t *screen;
 	xcb_depth_t *depth;
 	xcb_visualtype_t *visual;
+	xcb_gcontext_t gc;
 	xcb_colormap_t colormap;
 	xcb_window_t window;
 	xcb_atom_t delete_window_atom;
 };
 
-static bool set_preferred_screen(struct xcb* xcb, const int preferred_screen)
+static bool set_preferred_screen(struct xcb *xcb, const int preferred_screen)
 {
 	const xcb_setup_t *setup = xcb_get_setup(xcb->connection);
 	xcb_screen_iterator_t iter = xcb_setup_roots_iterator(setup);
@@ -180,15 +179,15 @@ static bool set_wm_protocols(struct xcb *xcb)
 		return false;
 	}
 
-    xcb_void_cookie_t cookie = xcb_change_property(
-            xcb->connection,
-            XCB_PROP_MODE_REPLACE,
-            xcb->window,
-            proto_reply->atom,
-            4,
-            32,
-            1,
-            &dw_reply->atom);
+	xcb_void_cookie_t cookie = xcb_change_property(
+			xcb->connection,
+			XCB_PROP_MODE_REPLACE,
+			xcb->window,
+			proto_reply->atom,
+			4,
+			32,
+			1,
+			&dw_reply->atom);
 
 	xcb->delete_window_atom = dw_reply->atom;
 
@@ -196,12 +195,34 @@ static bool set_wm_protocols(struct xcb *xcb)
 	free(dw_reply);
 
 	xcb_generic_error_t *error = xcb_request_check(xcb->connection, cookie);
-    if (error) {
+	if (error) {
 		fprintf(stderr, "ERROR: failed to set window manager protocols (%s)\n",
 				xcb_errors[error->error_code]);
-        free(error);
+		free(error);
 		return false;
-    }
+	}
+
+	return true;
+}
+
+static bool create_gc(struct xcb *xcb)
+{
+	xcb_gcontext_t gc = xcb_generate_id(xcb->connection);
+	xcb_void_cookie_t cookie = xcb_create_gc_checked(
+			xcb->connection,
+			gc,
+			xcb->window,
+			0, NULL);
+
+	xcb_generic_error_t *error = xcb_request_check(xcb->connection, cookie);
+	if (error) {
+		fprintf(stderr, "ERROR: failed to create graphis context (%s)\n",
+				xcb_errors[error->error_code]);
+		free(error);
+		return false;
+	}
+
+	xcb->gc = gc;
 
 	return true;
 }
@@ -242,7 +263,7 @@ error:
 	return NULL;
 }
 
-static bool create_xcb_window(struct xcb *xcb, int width, int height)
+static struct window *create_xcb_window(struct xcb *xcb, int width, int height)
 {
 	unsigned int opaque = 0xFF000000;
 
@@ -282,11 +303,28 @@ static bool create_xcb_window(struct xcb *xcb, int width, int height)
 
 	set_wm_class(xcb);
 	set_wm_protocols(xcb);
+	create_gc(xcb);
+
+	int alloc_size = sizeof(struct window) +
+		(width * height * (xcb->depth->depth / 4));
+
+
+	struct window *window_data = calloc(1, alloc_size);
+
+	if (!window_data) {
+		fprintf(stderr, "ERROR: Failed to allocated memory for window\n");
+		return false;
+	}
+
+	window_data->width = width;
+	window_data->height = height;
+	window_data->bits_per_pixel = xcb->depth->depth;
+	window_data->buffer = window_data + sizeof(struct window);
 
 	xcb_map_window(xcb->connection, xcb->window);
 	xcb_flush(xcb->connection);
 
-	return true;
+	return window_data;
 }
 
 static bool handle_xcb_events(struct xcb *xcb)
@@ -296,7 +334,7 @@ static bool handle_xcb_events(struct xcb *xcb)
 	while ((event = xcb_poll_for_event(xcb->connection))) {
 		switch (event->response_type & ~0x80) {
 			case XCB_CLIENT_MESSAGE: {
-				xcb_client_message_event_t *c_event = (void*)event;
+				xcb_client_message_event_t *c_event = (void *)event;
 				if (*c_event->data.data32 == xcb->delete_window_atom)
 					return false;
 			}
@@ -314,7 +352,7 @@ static void close_xcb(struct xcb *xcb)
 
 struct video_driver *init_video_driver(void)
 {
-	struct video_driver *driver = malloc(sizeof(struct video_driver));
+	struct video_driver *driver = calloc(1, sizeof(struct video_driver));
 	if (!driver) {
 		fprintf(stderr, "ERROR: could not allocate memory for video driver\n");
 		return NULL;
@@ -330,9 +368,48 @@ struct video_driver *init_video_driver(void)
 	return driver;
 }
 
-bool create_window(struct video_driver *driver, int width, int height)
+struct window *create_window(struct video_driver *driver, int width, int height)
 {
-	return create_xcb_window(driver->driver_data, width, height);
+	struct window *window =
+		create_xcb_window(driver->driver_data, width, height);
+
+	if (window) {
+		window->parent = driver;
+		return window;
+	}
+
+	return NULL;
+}
+
+void blit_buffer(struct window *window)
+{
+	const int buffer_size = window->width * window->height *
+		window->bits_per_pixel / 8;
+
+	struct xcb *xcb = window->parent->driver_data;
+
+	xcb_void_cookie_t cookie = xcb_put_image_checked(
+			xcb->connection,
+			XCB_IMAGE_FORMAT_Z_PIXMAP,
+			xcb->window,
+			xcb->gc,
+			window->width, window->height,
+			0, 0,
+			0,
+			window->bits_per_pixel,
+			buffer_size,
+			window->buffer);
+
+	xcb_generic_error_t *error = xcb_request_check(
+			xcb->connection,
+			cookie);
+
+	if (error) {
+		fprintf(stderr, "ERROR: failed to put image (%s)\n",
+				xcb_errors[error->error_code]);
+	}
+
+	xcb_flush(xcb->connection);
 }
 
 bool handle_events(struct video_driver *driver)
@@ -343,6 +420,7 @@ bool handle_events(struct video_driver *driver)
 void close_video_driver(struct video_driver *driver)
 {
 	close_xcb(driver->driver_data);
+	free(driver->window->buffer);
 	free(driver);
 }
 
