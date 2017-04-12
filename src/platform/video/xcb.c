@@ -420,7 +420,7 @@ bool handle_events(struct video_driver *driver)
 void close_video_driver(struct video_driver *driver)
 {
 	close_xcb(driver->driver_data);
-	free(driver->window->buffer);
+	free(driver->window);
 	free(driver);
 }
 

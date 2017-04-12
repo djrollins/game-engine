@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -g
+CFLAGS += -std=gnu99 -Wall -Wextra -Wpedantic -Werror -g -O3
 LDFLAGS += -ldl -lxcb
 
 SOURCES = src/linux_main.c src/platform/video/xcb.c
