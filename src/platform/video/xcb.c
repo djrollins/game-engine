@@ -3,7 +3,6 @@
 
 #include <xcb/xcb.h>
 #include <xcb/xcb_util.h>
-#include <xcb/xcb_image.h>
 #include <xcb/shm.h>
 
 
@@ -34,6 +33,12 @@ const char *xcb_errors[] = {
 	"Unknown"
 };
 
+struct shm_segment_info {
+	int id;
+	void *data;
+	xcb_shm_seg_t segment;
+};
+
 struct xcb {
 	xcb_connection_t *connection;
 	xcb_screen_t *screen;
@@ -43,7 +48,7 @@ struct xcb {
 	xcb_colormap_t colormap;
 	xcb_window_t window;
 	xcb_atom_t delete_window_atom;
-	xcb_shm_segment_info_t shm;
+	struct shm_segment_info shm;
 };
 
 static bool set_preferred_screen(struct xcb *xcb, const int preferred_screen)
@@ -321,25 +326,25 @@ static struct window *create_xcb_window(struct xcb *xcb, int width, int height)
 
 	/* TODO(djr): Error checking and logging for shm */
 	/* create a shared memory segment for the backbuffer */
-	xcb->shm.shmid = shmget(
+	xcb->shm.id = shmget(
 			IPC_PRIVATE,
 			width * height * xcb->depth->depth / 4,
 			IPC_CREAT | 0777);
 
 	/* attach shared memory segment to my address space */
-	xcb->shm.shmaddr = shmat(xcb->shm.shmid, 0, 0);
+	xcb->shm.data = shmat(xcb->shm.id, 0, 0);
 
 	/* attach the shared memory segment to the X servers address space */
-	xcb->shm.shmseg = xcb_generate_id(xcb->connection);
-	xcb_shm_attach(xcb->connection, xcb->shm.shmseg, xcb->shm.shmid, 0);
+	xcb->shm.segment = xcb_generate_id(xcb->connection);
+	xcb_shm_attach(xcb->connection, xcb->shm.segment, xcb->shm.id, 0);
 
 	/* Mark this segment to be destroyed when dettached */
-	shmctl(xcb->shm.shmid, IPC_RMID, 0);
+	shmctl(xcb->shm.id, IPC_RMID, 0);
 
 	window_data->width = width;
 	window_data->height = height;
 	window_data->bits_per_pixel = xcb->depth->depth;
-	window_data->buffer = xcb->shm.shmaddr;
+	window_data->buffer = xcb->shm.data;
 
 	xcb_map_window(xcb->connection, xcb->window);
 	xcb_flush(xcb->connection);
@@ -366,7 +371,7 @@ static bool handle_xcb_events(struct xcb *xcb)
 
 static void close_xcb(struct xcb *xcb)
 {
-	xcb_shm_detach(xcb->connection, xcb->shm.shmseg);
+	xcb_shm_detach(xcb->connection, xcb->shm.segment);
 	xcb_disconnect(xcb->connection);
 	free(xcb);
 }
@@ -391,6 +396,12 @@ struct video_driver *init_video_driver(void)
 
 struct window *create_window(struct video_driver *driver, int width, int height)
 {
+	/* TODO(djr): Handle multiple windows? */
+	if (driver->window != NULL) {
+		fprintf(stderr, "ERROR: a window already exists\n");
+		return NULL;
+	}
+
 	struct window *window =
 		create_xcb_window(driver->driver_data, width, height);
 
@@ -417,7 +428,7 @@ void blit_buffer(struct window *window)
 			xcb->depth->depth,
 			XCB_IMAGE_FORMAT_Z_PIXMAP,
 			0,
-			xcb->shm.shmseg,
+			xcb->shm.segment,
 			0);
 
 	xcb_generic_error_t *error = xcb_request_check(
