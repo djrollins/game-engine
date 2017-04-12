@@ -319,14 +319,21 @@ static struct window *create_xcb_window(struct xcb *xcb, int width, int height)
 		return false;
 	}
 
+	/* TODO(djr): Error checking and logging for shm */
+	/* create a shared memory segment for the backbuffer */
 	xcb->shm.shmid = shmget(
 			IPC_PRIVATE,
 			width * height * xcb->depth->depth / 4,
 			IPC_CREAT | 0777);
 
+	/* attach shared memory segment to my address space */
 	xcb->shm.shmaddr = shmat(xcb->shm.shmid, 0, 0);
+
+	/* attach the shared memory segment to the X servers address space */
 	xcb->shm.shmseg = xcb_generate_id(xcb->connection);
 	xcb_shm_attach(xcb->connection, xcb->shm.shmseg, xcb->shm.shmid, 0);
+
+	/* Mark this segment to be destroyed when dettached */
 	shmctl(xcb->shm.shmid, IPC_RMID, 0);
 
 	window_data->width = width;
