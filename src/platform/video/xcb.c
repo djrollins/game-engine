@@ -1,5 +1,11 @@
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
 #include <xcb/xcb.h>
 #include <xcb/xcb_util.h>
+#include <xcb/xcb_image.h>
+#include <xcb/shm.h>
+
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -37,6 +43,7 @@ struct xcb {
 	xcb_colormap_t colormap;
 	xcb_window_t window;
 	xcb_atom_t delete_window_atom;
+	xcb_shm_segment_info_t shm;
 };
 
 static bool set_preferred_screen(struct xcb *xcb, const int preferred_screen)
@@ -305,21 +312,27 @@ static struct window *create_xcb_window(struct xcb *xcb, int width, int height)
 	set_wm_protocols(xcb);
 	create_gc(xcb);
 
-	int alloc_size = sizeof(struct window) +
-		(width * height * (xcb->depth->depth / 4));
-
-
-	struct window *window_data = calloc(1, alloc_size);
+	struct window *window_data = calloc(1, sizeof(struct window));
 
 	if (!window_data) {
 		fprintf(stderr, "ERROR: Failed to allocated memory for window\n");
 		return false;
 	}
 
+	xcb->shm.shmid = shmget(
+			IPC_PRIVATE,
+			width * height * xcb->depth->depth / 4,
+			IPC_CREAT | 0777);
+
+	xcb->shm.shmaddr = shmat(xcb->shm.shmid, 0, 0);
+	xcb->shm.shmseg = xcb_generate_id(xcb->connection);
+	xcb_shm_attach(xcb->connection, xcb->shm.shmseg, xcb->shm.shmid, 0);
+	shmctl(xcb->shm.shmid, IPC_RMID, 0);
+
 	window_data->width = width;
 	window_data->height = height;
 	window_data->bits_per_pixel = xcb->depth->depth;
-	window_data->buffer = window_data + sizeof(struct window);
+	window_data->buffer = xcb->shm.shmaddr;
 
 	xcb_map_window(xcb->connection, xcb->window);
 	xcb_flush(xcb->connection);
@@ -346,6 +359,7 @@ static bool handle_xcb_events(struct xcb *xcb)
 
 static void close_xcb(struct xcb *xcb)
 {
+	xcb_shm_detach(xcb->connection, xcb->shm.shmseg);
 	xcb_disconnect(xcb->connection);
 	free(xcb);
 }
@@ -383,22 +397,21 @@ struct window *create_window(struct video_driver *driver, int width, int height)
 
 void blit_buffer(struct window *window)
 {
-	const int buffer_size = window->width * window->height *
-		window->bits_per_pixel / 8;
-
 	struct xcb *xcb = window->parent->driver_data;
 
-	xcb_void_cookie_t cookie = xcb_put_image_checked(
+	xcb_void_cookie_t cookie = xcb_shm_put_image_checked(
 			xcb->connection,
-			XCB_IMAGE_FORMAT_Z_PIXMAP,
 			xcb->window,
 			xcb->gc,
 			window->width, window->height,
 			0, 0,
+			window->width, window->height,
+			0, 0,
+			xcb->depth->depth,
+			XCB_IMAGE_FORMAT_Z_PIXMAP,
 			0,
-			window->bits_per_pixel,
-			buffer_size,
-			window->buffer);
+			xcb->shm.shmseg,
+			0);
 
 	xcb_generic_error_t *error = xcb_request_check(
 			xcb->connection,
