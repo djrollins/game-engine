@@ -8,7 +8,7 @@ int main(void)
 {
 	struct video_driver *video_driver = init_video_driver();
 
-	struct window *window = create_window(video_driver, 1600, 900);
+	struct window *window = create_window(video_driver, 1280, 720);
 
 	const int buffer_size = window->width * window->height;
 

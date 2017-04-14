@@ -5,7 +5,6 @@
 #include <xcb/xcb_util.h>
 #include <xcb/shm.h>
 
-
 #include <stdlib.h>
 #include <stdio.h>
 
