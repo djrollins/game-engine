@@ -190,7 +190,6 @@ struct ring_buffer
 	unsigned int write_cursor;
 	unsigned int target_latency;
 	void *data;
-	pthread_mutex_t mutex;
 };
 
 struct alsa_context
@@ -207,11 +206,10 @@ struct alsa_context
 static int update_audio(struct alsa_context *context)
 {
 	struct ring_buffer *buffer = &context->buffer;
-	pthread_mutex_t *const mutex = &buffer->mutex;
 
-	if (pthread_mutex_trylock(mutex) == 0) {
 		const int read_cursor = buffer->read_cursor;
 		const int write_cursor = buffer->write_cursor;
+
 		const int cursor_diff = write_cursor - read_cursor;
 		const int buffer_size = buffer->size;
 		const unsigned int frame_size = buffer->frame_size;
@@ -226,15 +224,9 @@ static int update_audio(struct alsa_context *context)
 			frames_to_write = MIN(frames_to_end, period_size);
 		}
 
-		memcpy(context->play_buffer, buffer->data + (read_cursor * frame_size), frames_to_write * frame_size);
-
-		buffer->read_cursor = (read_cursor + frames_to_write) % buffer_size;
-
-		pthread_mutex_unlock(mutex);
-
 		if (frames_to_write) {
 			snd_pcm_uframes_t frames_left = frames_to_write;
-			const int16_t *play_buffer = context->play_buffer;
+			const int16_t *play_buffer = buffer->data + (read_cursor * frame_size);;
 
 			while (frames_left > 0) {
 				int status;
@@ -253,15 +245,11 @@ static int update_audio(struct alsa_context *context)
 						continue;
 					}
 
-					/* TODO(djr): Find a better way to handle this error */
 					if (status == -EPIPE) {
 						/* underrun detected, increase latency and silence play_buffer */
-						pthread_mutex_lock(mutex);
 						const unsigned int latency = buffer->target_latency;
-						memset(context->play_buffer, 0, frames_left * frame_size);
 						buffer->target_latency += latency / 10;
 						fprintf(stderr, "audio latency increased: %d -> %d\n", latency, buffer->target_latency);
-						pthread_mutex_unlock(mutex);
 					}
 
 					status = snd_pcm_recover(context->pcm_handle, status, 0);
@@ -284,7 +272,8 @@ static int update_audio(struct alsa_context *context)
 			const struct timespec delay = { 0, 16000L }; /* 16ms */
 			nanosleep(&delay, NULL);
 		}
-	}
+
+		buffer->read_cursor = (read_cursor + frames_to_write) % buffer_size;
 
 	return 1;
 }
@@ -398,13 +387,6 @@ static struct ring_buffer *init_audio(
 
 	/* start audio thread */
 	pthread_t audio_thread;
-
-	status = pthread_mutex_init(&context->buffer.mutex, NULL);
-	if (status) {
-		fprintf(stderr, "Unable to create mutex for audio thread: %s\n", strerror(status));
-		free(memory);
-		return NULL;
-	}
 
 	status = pthread_create(&audio_thread, NULL, update_audio_thread_driver, context);
 	if (status) {
@@ -672,8 +654,8 @@ int main()
 			running = 0;
 		}
 
-		pthread_mutex_t *const mutex = &audio_buffer->mutex;
-		if (pthread_mutex_lock(mutex) == 0) {
+		// update audio
+		{
 			int16_t *sample_ptr;
 			unsigned int frames_to_write;
 			unsigned int region_one_size;
@@ -689,6 +671,7 @@ int main()
 			const unsigned int latency = audio_buffer->target_latency;
 			const unsigned int sample_index = running_sample_index % buffer_size;
 			const unsigned int target_cursor = (read_cursor + latency) % buffer_size;
+
 
 			const float tone_hz = base_hz + ((state.left_stick_x - state.left_stick_y) * base_hz / 4);
 			const float tone_diff = tone_hz - previous_tone_hz;
@@ -735,9 +718,9 @@ int main()
 
 			}
 			previous_tone_hz = tone_hz;
+
 			audio_buffer->write_cursor = target_cursor;
-			pthread_mutex_unlock(mutex);
-		}
+		} // update audio
 
 		xoffset -= state.left_stick_x * 5;
 		yoffset -= state.left_stick_y * 5;
